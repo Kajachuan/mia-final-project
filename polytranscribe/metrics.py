@@ -10,8 +10,8 @@ from .stems import DRUM_MIDI
 def paper_voicing_gate(note_prob: np.ndarray, features: np.ndarray,
                        percentile: float = 10.0) -> np.ndarray:
     """Paper-style global Mel/chroma voicing mask applied to every candidate pitch."""
-    if features.shape[0] != 6:
-        raise ValueError("Expected six feature maps")
+    if features.shape[0] < 6:
+        raise ValueError("Expected at least six feature maps")
     energy = features[5, 0]
     cutoff = np.percentile(energy, percentile)
     voiced = energy > cutoff

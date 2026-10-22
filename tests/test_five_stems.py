@@ -42,7 +42,7 @@ def test_pitched_and_drum_features_and_model():
     cfg = config_for_stem("piano")
     audio = torch.randn(round(cfg.sample_rate * seconds)) * 0.01
     x = pitch_features(audio, cfg, torch.device("cpu"))
-    assert x.shape[0:2] == (6, cfg.pitches)
+    assert x.shape[0:2] == (10, cfg.pitches)
     assert np.isfinite(x).all()
     drums_cfg = config_for_stem("drums")
     mel = drum_features(audio, drums_cfg, torch.device("cpu"))

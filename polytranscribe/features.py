@@ -7,7 +7,7 @@ import torch
 
 from .config import Config
 
-FEATURE_VERSION = 3
+FEATURE_VERSION = 4
 
 
 def load_audio(path, cfg: Config) -> torch.Tensor:
@@ -23,7 +23,7 @@ def load_audio(path, cfg: Config) -> torch.Tensor:
 
 
 def pitch_features(audio: torch.Tensor, cfg: Config, device: torch.device) -> np.ndarray:
-    """Six maps [F0, harmonics, subharmonics, Mel F0, chroma class, voicing]."""
+    """Ten maps: six baseline cues plus separate harmonics 2 through 5."""
     audio = audio.to(device)
     if audio.numel() < cfg.n_fft:
         audio = torch.nn.functional.pad(audio, (0, cfg.n_fft - audio.numel()))
@@ -76,7 +76,8 @@ def pitch_features(audio: torch.Tensor, cfg: Config, device: torch.device) -> np
     voicing = chroma.mean(dim=0)[None, :].expand_as(mel_f0)
 
     features = torch.stack([fundamental, harmonics, subharmonics,
-                            mel_f0, chroma_pitch, voicing]).log1p()
+                            mel_f0, chroma_pitch, voicing,
+                            *harmonic_maps.unbind(0)]).log1p()
     features = (features - features.mean()) / features.std().clamp_min(1e-4)
     return features.cpu().numpy().astype(np.float16)
 

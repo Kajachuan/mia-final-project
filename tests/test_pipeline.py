@@ -19,7 +19,7 @@ def test_audio_to_model_and_midi(tmp_path):
     sf.write(audio_path, chord, sr)
     audio = load_audio(audio_path, cfg)
     x = pitch_features(audio, cfg, torch.device("cpu"))
-    assert x.shape == (6, cfg.pitches, 1 + sr // cfg.hop_length)
+    assert x.shape == (10, cfg.pitches, 1 + sr // cfg.hop_length)
     assert np.isfinite(x).all()
     batch = torch.from_numpy(x.astype(np.float32))[None]
     for variant in ("baseline", "gated"):
@@ -95,7 +95,7 @@ def test_five_stem_pipeline_writes_independent_tracks(tmp_path, monkeypatch):
     mixture.write_bytes(b"fixture")
     models = tmp_path / "models"
     for stem in TARGET_STEMS:
-        checkpoint = models / stem / ("baseline.pt" if stem == "drums" else "gated.pt")
+        checkpoint = models / stem / ("advanced.pt" if stem == "drums" else "advanced_gated.pt")
         checkpoint.parent.mkdir(parents=True)
         torch.save({"stem": stem, "task": "drums" if stem == "drums" else "pitched"}, checkpoint)
     stems = {}

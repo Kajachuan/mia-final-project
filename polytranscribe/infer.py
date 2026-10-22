@@ -10,7 +10,7 @@ import torch
 from .config import Config
 from .features import FEATURE_VERSION, drum_features, load_audio, pitch_features
 from .metrics import decode_drums, decode_notes, paper_voicing_gate
-from .model import DrumTranscriber, PolyphonicTranscriber
+from .model import build_transcriber, predict_in_chunks
 from .stems import TARGET_STEMS
 
 
@@ -95,20 +95,19 @@ def transcribe_stem(audio_path: Path, checkpoint: Path, midi_path: Path) -> int:
         raise ValueError("Checkpoint uses an outdated feature schema; retrain the model")
     cfg = Config(**saved["config"])
     task = saved.get("task", "pitched")
-    model = (DrumTranscriber(classes=cfg.pitches) if task == "drums"
-             else PolyphonicTranscriber(saved["variant"])).to(device)
+    model = build_transcriber(task, saved["variant"], cfg.pitches).to(device)
     model.load_state_dict(saved["model"])
     model.eval()
     with torch.no_grad():
         audio = load_audio(audio_path, cfg)
         features = drum_features(audio, cfg, device) if task == "drums" else pitch_features(audio, cfg, device)
-        x = torch.from_numpy(features.astype("float32"))[None].to(device)
-        note, onset = model(x)
+        x = torch.from_numpy(features.astype("float32"))[None]
+        note, onset = predict_in_chunks(model, x, device)
         note_prob = note[0].cpu().numpy()
         if saved.get("gate_mode") == "paper_fixed":
             if task == "drums":
                 raise ValueError("The harmonic voicing gate is not defined for drums")
-            note_prob = paper_voicing_gate(note_prob, x[0].cpu().numpy())
+            note_prob = paper_voicing_gate(note_prob, x[0].numpy())
         events = (decode_drums(note_prob, cfg, threshold=saved["threshold"])
                   if task == "drums" else
                   decode_notes(note_prob, torch.sigmoid(onset[0]).cpu().numpy(),

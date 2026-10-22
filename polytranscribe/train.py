@@ -19,10 +19,10 @@ from .data import player_split
 from .features import FEATURE_VERSION
 from .metrics import (decode_drums, decode_notes, frame_scores, frame_scores_by_polyphony,
                       note_scores, paper_voicing_gate)
-from .model import DrumTranscriber, PolyphonicTranscriber
+from .model import build_transcriber, predict_in_chunks
 
 
-CHECKPOINT_FORMAT = 1
+CHECKPOINT_FORMAT = 2
 
 
 def atomic_torch_save(payload: dict, path: Path) -> None:
@@ -95,7 +95,7 @@ def predictions(model: nn.Module, files: list[Path], device: torch.device,
     outputs = []
     for path in files:
         x, y, _, events = read_cache(path)
-        note, onset = model(torch.from_numpy(x[None]).to(device))
+        note, onset = predict_in_chunks(model, torch.from_numpy(x[None]), device)
         note_prob = note[0].cpu().numpy()
         if fixed_gate:
             note_prob = paper_voicing_gate(note_prob, x)
@@ -137,33 +137,41 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, default=Path("data/guitarset/cache"))
     parser.add_argument("--output", type=Path, default=Path("runs"))
-    parser.add_argument("--variant", required=True, choices=("baseline", "gated"))
+    parser.add_argument("--variant", required=True,
+                        choices=("baseline", "gated", "advanced_plain", "advanced_gated", "advanced"))
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--window-frames", type=int)
     parser.add_argument("--resume", type=Path, help="Previous *_last.pt, including from /kaggle/input")
     parser.add_argument("--checkpoint-every", type=int, default=25,
                         help="Save resumable state after this many batches")
     parser.add_argument("--max-runtime-minutes", type=float, default=0,
                         help="Stop cleanly at a batch boundary before a session limit; 0 disables")
     args = parser.parse_args()
-    if args.epochs < 1 or args.batch_size < 1 or args.checkpoint_every < 1 or args.max_runtime_minutes < 0:
+    if (args.epochs < 1 or (args.batch_size is not None and args.batch_size < 1)
+            or (args.window_frames is not None and args.window_frames < 16)
+            or args.checkpoint_every < 1 or args.max_runtime_minutes < 0):
         parser.error("epochs, batch size and checkpoint interval must be positive; runtime must be nonnegative")
     manifest = json.loads((args.cache / "manifest.json").read_text(encoding="utf-8"))
-    cfg = replace(Config(**manifest["config"]), epochs=args.epochs, batch_size=args.batch_size)
+    advanced = args.variant.startswith("advanced")
+    cfg = replace(Config(**manifest["config"]), epochs=args.epochs,
+                  batch_size=args.batch_size or (4 if advanced else 16),
+                  window_frames=args.window_frames or (256 if advanced else manifest["config"]["window_frames"]))
     task = manifest.get("task", "pitched")
     stem = manifest.get("stem", "guitar")
     if task not in ("pitched", "drums"):
         raise ValueError(f"Unknown training task: {task}")
-    if task == "drums" and args.variant != "baseline":
-        parser.error("Drum training uses --variant baseline; harmonic gating is for pitched stems")
+    if task == "drums" and args.variant not in ("baseline", "advanced"):
+        parser.error("Drums support baseline or advanced; harmonic gating is for pitched stems")
+    if task == "pitched" and args.variant == "advanced":
+        parser.error("Pitched stems use advanced_plain or advanced_gated")
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     files = split_files(args.cache, cfg)
     dataset = WindowDataset(files["train"], cfg)
-    model = (DrumTranscriber(classes=cfg.pitches) if task == "drums"
-             else PolyphonicTranscriber(args.variant)).to(device)
+    model = build_transcriber(task, args.variant, cfg.pitches).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     onset_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(10.0, device=device))
     args.output.mkdir(parents=True, exist_ok=True)
@@ -243,6 +251,8 @@ def main() -> None:
             if task == "pitched":
                 loss = loss + 0.25 * onset_loss(onset_logits, onset)
             loss.backward()
+            if advanced:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             loss_sum += float(loss.detach().cpu())
             loss_count += 1
@@ -256,13 +266,14 @@ def main() -> None:
                 return
         val_outputs = predictions(model, files["val"], device)
         options = [(t, summarize(val_outputs, t, cfg, task)) for t in (0.25, 0.35, 0.45, 0.55, 0.65)]
-        threshold, val = max(options, key=lambda pair: pair[1]["frame"]["f1"])
+        threshold, val = max(options, key=lambda pair: (pair[1]["note"]["f1"],
+                                                          pair[1]["frame"]["f1"]))
         row = {"epoch": epoch, "loss": loss_sum / max(loss_count, 1), "threshold": threshold,
                "val_frame_f1": val["frame"]["f1"], "val_note_f1": val["note"]["f1"]}
         history.append(row)
         print(json.dumps(row), flush=True)
-        if val["frame"]["f1"] > best:
-            best = val["frame"]["f1"]
+        if val["note"]["f1"] > best:
+            best = val["note"]["f1"]
             best_checkpoint = {"model": copy.deepcopy(model.state_dict()),
                                "config": cfg.to_dict(), "feature_version": FEATURE_VERSION,
                                "variant": args.variant, "task": task, "stem": stem,
@@ -282,19 +293,21 @@ def main() -> None:
               "split": manifest.get("split", "dataset-defined train/validation/test")}
     (args.output / f"{args.variant}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps({"variant": args.variant, "test": test}, indent=2))
-    if args.variant == "baseline" and task == "pitched":
+    if args.variant in ("baseline", "advanced_plain") and task == "pitched":
         fixed_val_outputs = predictions(model, files["val"], device, fixed_gate=True)
         fixed_options = [(t, summarize(fixed_val_outputs, t, cfg, task)) for t in (0.25, 0.35, 0.45, 0.55, 0.65)]
-        fixed_threshold, fixed_val = max(fixed_options, key=lambda pair: pair[1]["frame"]["f1"])
+        fixed_threshold, fixed_val = max(fixed_options, key=lambda pair: (pair[1]["note"]["f1"],
+                                                                     pair[1]["frame"]["f1"]))
         fixed_test = summarize(predictions(model, files["test"], device, fixed_gate=True),
                                fixed_threshold, cfg, task)
-        fixed_result = {"variant": "paper_gate", "best_epoch": best_checkpoint["epoch"],
+        prefix = "paper_gate" if args.variant == "baseline" else "advanced_paper_gate"
+        fixed_result = {"variant": prefix, "best_epoch": best_checkpoint["epoch"],
                         "threshold": fixed_threshold, "validation": fixed_val, "test": fixed_test,
                         "split": result["split"], "gate_percentile": 10}
-        (args.output / "paper_gate.json").write_text(json.dumps(fixed_result, indent=2), encoding="utf-8")
+        (args.output / f"{prefix}.json").write_text(json.dumps(fixed_result, indent=2), encoding="utf-8")
         fixed_checkpoint = {**best_checkpoint, "threshold": fixed_threshold, "gate_mode": "paper_fixed"}
-        atomic_torch_save(fixed_checkpoint, args.output / "paper_gate.pt")
-        print(json.dumps({"variant": "paper_gate", "test": fixed_test}, indent=2))
+        atomic_torch_save(fixed_checkpoint, args.output / f"{prefix}.pt")
+        print(json.dumps({"variant": prefix, "test": fixed_test}, indent=2))
     write_status("complete", cfg.epochs + 1, 0)
 
 

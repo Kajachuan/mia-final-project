@@ -12,7 +12,7 @@ from .stems import TARGET_STEMS
 
 
 def checkpoint_paths(models_root: Path) -> dict[str, Path]:
-    paths = {stem: models_root / stem / ("baseline.pt" if stem == "drums" else "gated.pt")
+    paths = {stem: models_root / stem / ("advanced.pt" if stem == "drums" else "advanced_gated.pt")
              for stem in TARGET_STEMS}
     missing = [str(path) for path in paths.values() if not path.is_file()]
     if missing:
@@ -73,7 +73,7 @@ def main() -> None:
     parser.add_argument("--audio", type=Path, required=True, help="Music mixture to separate")
     models = parser.add_mutually_exclusive_group(required=True)
     models.add_argument("--models-root", type=Path,
-                        help="Directory with vocals/gated.pt, drums/baseline.pt, etc.")
+                        help="Directory with vocals/advanced_gated.pt, drums/advanced.pt, etc.")
     models.add_argument("--checkpoint", type=Path,
                         help="Legacy one-guitar ablation checkpoint")
     parser.add_argument("--output-dir", type=Path, required=True)
