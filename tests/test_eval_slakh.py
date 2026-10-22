@@ -54,7 +54,8 @@ def test_slakh_evaluation_scores_oracle_and_separated_audio(tmp_path, monkeypatc
     sf.write(track / "mix.wav", guitar + piano, sr)
     write_midi([(0.1, 0.4, 40)], track / "MIDI" / "S01.mid")
     metadata = {"audio_dir": "stems", "midi_dir": "MIDI", "stems": {
-        "S01": {"inst_class": "Guitar", "is_drum": False},
+        "S01": {"inst_class": "Guitar", "is_drum": False,
+                "audio_rendered": False, "midi_saved": False},
         "S02": {"inst_class": "Piano", "is_drum": False}}}
     (track / "metadata.yaml").write_text(yaml.safe_dump(metadata), encoding="utf-8")
     checkpoint = tmp_path / "checkpoint.pt"

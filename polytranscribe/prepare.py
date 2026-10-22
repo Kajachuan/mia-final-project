@@ -94,6 +94,7 @@ def main() -> None:
         if i % 30 == 0:
             print(f"Cached {i}/{len(pairs)}", flush=True)
     manifest = {"config": cfg.to_dict(), "feature_version": FEATURE_VERSION,
+                "task": "pitched", "stem": "guitar",
                 "counts": dict(counts), "overlap_frames": overlaps,
                 "source": str(source_root.resolve()), "input": "microphone mono",
                 "split": "player 00-03/04/05"}

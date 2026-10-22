@@ -4,6 +4,7 @@ import numpy as np
 import mir_eval
 
 from .config import Config
+from .stems import DRUM_MIDI
 
 
 def paper_voicing_gate(note_prob: np.ndarray, features: np.ndarray,
@@ -65,6 +66,30 @@ def decode_notes(note_prob: np.ndarray, onset_prob: np.ndarray, cfg: Config,
                 if right - left >= min_frames:
                     events.append((left * cfg.frame_seconds, right * cfg.frame_seconds,
                                    pitch_index + cfg.midi_min))
+    return sorted(events)
+
+
+def decode_drums(probabilities: np.ndarray, cfg: Config,
+                 threshold: float = 0.5, minimum_gap: float = 0.05) -> list[tuple[float, float, int]]:
+    """Local onset peaks per drum class, with overlapping hits across classes."""
+    events = []
+    gap_frames = max(1, round(minimum_gap / cfg.frame_seconds))
+    for drum_class, row in enumerate(probabilities):
+        candidates = np.flatnonzero(row >= threshold)
+        peaks = [i for i in candidates if row[i] >= row[max(0, i - 1)]
+                 and row[i] >= row[min(len(row) - 1, i + 1)]]
+        last = -gap_frames
+        for index in peaks:
+            if index - last < gap_frames:
+                if events and row[index] > row[last] and events[-1][2] == DRUM_MIDI[drum_class]:
+                    events[-1] = (index * cfg.frame_seconds,
+                                  index * cfg.frame_seconds + 0.1,
+                                  DRUM_MIDI[drum_class])
+                    last = index
+                continue
+            start = index * cfg.frame_seconds
+            events.append((start, start + 0.1, DRUM_MIDI[drum_class]))
+            last = index
     return sorted(events)
 
 

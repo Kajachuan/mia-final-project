@@ -76,14 +76,50 @@ def test_separation_precedes_transcription(tmp_path, monkeypatch):
     monkeypatch.setattr(separate, "get_model", fake_get_model)
     monkeypatch.setattr(separate, "apply_model", fake_apply_model)
     monkeypatch.setattr(pipeline, "transcribe_stem", fake_transcribe)
-    result = pipeline.transcribe_mix(mixture, checkpoint, tmp_path / "result")
+    result = pipeline.transcribe_guitar_mix(mixture, checkpoint, tmp_path / "result")
     assert calls == ["separate", "transcribe"]
-    assert result["note_count"] == 2
-    assert result["transcribed_stem"] == "guitar"
+    assert result["note_counts"] == {"guitar": 2}
+    assert result["transcribed_stems"] == ["guitar"]
     assert result["separator"] == "htdemucs_6s"
     assert set(result["stems"]) == set(separate.STEMS)
     assert (tmp_path / "result" / "guitar.mid").exists()
     assert (tmp_path / "result" / "pipeline.json").exists()
+
+
+def test_five_stem_pipeline_writes_independent_tracks(tmp_path, monkeypatch):
+    from polytranscribe.infer import write_midi
+    from polytranscribe.stems import TARGET_STEMS
+    import mido
+
+    mixture = tmp_path / "mix.wav"
+    mixture.write_bytes(b"fixture")
+    models = tmp_path / "models"
+    for stem in TARGET_STEMS:
+        checkpoint = models / stem / ("baseline.pt" if stem == "drums" else "gated.pt")
+        checkpoint.parent.mkdir(parents=True)
+        torch.save({"stem": stem, "task": "drums" if stem == "drums" else "pitched"}, checkpoint)
+    stems = {}
+    for stem in (*TARGET_STEMS, "other"):
+        path = tmp_path / f"{stem}.wav"
+        path.write_bytes(b"fixture")
+        stems[stem] = path
+    monkeypatch.setattr(pipeline, "separate", lambda audio, output: stems)
+    calls = []
+
+    def fake_transcribe(audio, checkpoint, midi):
+        calls.append(audio.stem)
+        write_midi([(0.1, 0.2, 36 if audio.stem == "drums" else 60)], midi)
+        return 1
+
+    monkeypatch.setattr(pipeline, "transcribe_stem", fake_transcribe)
+    result = pipeline.transcribe_mix(mixture, models, tmp_path / "out")
+    assert calls == list(TARGET_STEMS)
+    assert result["excluded_stem"] == "other"
+    assert set(result["note_counts"]) == set(TARGET_STEMS)
+    combined = mido.MidiFile(result["midi"])
+    assert len(combined.tracks) == 6
+    assert any(message.channel == 9 for message in combined.tracks[2]
+               if message.type == "note_on")
 
 
 def test_mel_chroma_branch_changes_only_gated_model():
@@ -122,6 +158,8 @@ def test_baseline_training_resumes_from_batch_and_emits_paper_gate(tmp_path, mon
                                  dtype=np.float32))
         files[split] = [path]
     monkeypatch.setattr(train, "split_files", lambda cache, cfg: files)
+    (tmp_path / "manifest.json").write_text(json.dumps({"config": Config().to_dict(),
+                                                         "task": "pitched", "stem": "guitar"}))
     output = tmp_path / "first_run"
     monkeypatch.setattr(sys, "argv", ["train", "--cache", str(tmp_path),
                                       "--output", str(output), "--variant", "baseline",

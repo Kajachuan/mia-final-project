@@ -7,7 +7,7 @@ import torch
 
 from .config import Config
 
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 
 
 def load_audio(path, cfg: Config) -> torch.Tensor:
@@ -34,12 +34,19 @@ def pitch_features(audio: torch.Tensor, cfg: Config, device: torch.device) -> np
     fundamental_hz = 440.0 * (2.0 ** ((pitches - 69) / 12.0))
 
     def sample(multiplier: float) -> torch.Tensor:
-        bins = (fundamental_hz * multiplier * cfg.n_fft / cfg.sample_rate).round().long()
+        frequency = fundamental_hz * multiplier
+        valid = frequency < cfg.sample_rate / 2
+        bins = (frequency * cfg.n_fft / cfg.sample_rate).round().long()
         bins = bins.clamp(1, magnitude.shape[0] - 2)
-        return torch.stack([magnitude.index_select(0, bins + shift) for shift in (-1, 0, 1)]).amax(0)
+        sampled = torch.stack([magnitude.index_select(0, bins + shift)
+                               for shift in (-1, 0, 1)]).amax(0)
+        return sampled * valid[:, None]
 
     fundamental = sample(1.0)
-    harmonics = torch.stack([sample(float(h)) for h in (2, 3, 4, 5)]).mean(0)
+    harmonic_maps = torch.stack([sample(float(h)) for h in (2, 3, 4, 5)])
+    harmonic_counts = torch.stack([(fundamental_hz * h < cfg.sample_rate / 2).float()
+                                   for h in (2, 3, 4, 5)]).sum(0).clamp_min(1)
+    harmonics = harmonic_maps.sum(0) / harmonic_counts[:, None]
     subharmonics = torch.stack([sample(0.5), sample(1.0 / 3.0)]).mean(0)
 
     # Paper-inspired second branch: 256-band power Mel spectrogram and chroma.
@@ -72,3 +79,24 @@ def pitch_features(audio: torch.Tensor, cfg: Config, device: torch.device) -> np
                             mel_f0, chroma_pitch, voicing]).log1p()
     features = (features - features.mean()) / features.std().clamp_min(1e-4)
     return features.cpu().numpy().astype(np.float16)
+
+
+def drum_features(audio: torch.Tensor, cfg: Config, device: torch.device) -> np.ndarray:
+    """Log Mel energy for transient drum classification: [1, mel_band, time]."""
+    audio = audio.to(device)
+    if audio.numel() < cfg.n_fft:
+        audio = torch.nn.functional.pad(audio, (0, cfg.n_fft - audio.numel()))
+    magnitude = torch.stft(audio, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
+                           window=torch.hann_window(cfg.n_fft, device=device),
+                           center=True, return_complex=True).abs()
+    frequencies = torch.linspace(0, cfg.sample_rate / 2, magnitude.shape[0], device=device)
+    mel_max = 2595.0 * torch.log10(1.0 + frequencies[-1] / 700.0)
+    edges = torch.linspace(0, float(mel_max), cfg.n_mels + 2, device=device)
+    hz = 700.0 * (10.0 ** (edges / 2595.0) - 1.0)
+    lower = (frequencies[None, :] - hz[:-2, None]) / (hz[1:-1, None] - hz[:-2, None])
+    upper = (hz[2:, None] - frequencies[None, :]) / (hz[2:, None] - hz[1:-1, None])
+    filters = torch.minimum(lower, upper).clamp_min(0)
+    filters /= filters.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    mel = (filters @ magnitude.square()).log1p()
+    mel = (mel - mel.mean()) / mel.std().clamp_min(1e-4)
+    return mel[None].cpu().numpy().astype(np.float16)

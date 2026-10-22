@@ -17,9 +17,9 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from .config import Config
 from .data import player_split
 from .features import FEATURE_VERSION
-from .metrics import (decode_notes, frame_scores, frame_scores_by_polyphony,
+from .metrics import (decode_drums, decode_notes, frame_scores, frame_scores_by_polyphony,
                       note_scores, paper_voicing_gate)
-from .model import PolyphonicTranscriber
+from .model import DrumTranscriber, PolyphonicTranscriber
 
 
 CHECKPOINT_FORMAT = 1
@@ -72,9 +72,17 @@ def split_files(cache: Path, cfg: Config) -> dict[str, list[Path]]:
         if manifest["config"][key] != getattr(cfg, key):
             raise ValueError(f"Cache configuration mismatch: {key}")
     files = {split: [] for split in ("train", "val", "test")}
-    for path in sorted(cache.glob("*.npz")):
-        files[player_split(path.stem)].append(path)
-    expected = {"train": 240, "val": 60, "test": 60}
+    file_splits = manifest.get("file_splits")
+    if file_splits is not None:
+        for stem, split in sorted(file_splits.items()):
+            path = cache / f"{stem}.npz"
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            files[split].append(path)
+    else:
+        for path in sorted(cache.glob("*.npz")):
+            files[player_split(path.stem)].append(path)
+    expected = manifest["counts"] if file_splits is not None else {"train": 240, "val": 60, "test": 60}
     if {split: len(group) for split, group in files.items()} != expected:
         raise ValueError(f"Incomplete cache: expected {expected}, got { {k: len(v) for k,v in files.items()} }")
     return files
@@ -96,7 +104,7 @@ def predictions(model: nn.Module, files: list[Path], device: torch.device,
     return outputs
 
 
-def summarize(outputs, threshold: float, cfg: Config) -> dict:
+def summarize(outputs, threshold: float, cfg: Config, task: str = "pitched") -> dict:
     frame_counts = {"tp": 0, "fp": 0, "fn": 0}
     polyphonic_counts = {"tp": 0, "fp": 0, "fn": 0, "frames": 0}
     note_counts = {"tp": 0, "fp": 0, "fn": 0}
@@ -104,8 +112,9 @@ def summarize(outputs, threshold: float, cfg: Config) -> dict:
     for note, onset, target, reference in outputs:
         frame = frame_scores(note >= threshold, target)
         polyphonic = frame_scores_by_polyphony(note >= threshold, target)
-        estimated = decode_notes(note, onset, cfg, threshold=threshold)
-        notes = note_scores(estimated, reference)
+        estimated = (decode_drums(note, cfg, threshold=threshold) if task == "drums"
+                     else decode_notes(note, onset, cfg, threshold=threshold))
+        notes = note_scores(estimated, reference, offset_ratio=None if task == "drums" else 0.2)
         onsets = note_scores(estimated, reference, offset_ratio=None)
         for key in frame_counts:
             frame_counts[key] += frame[key]
@@ -139,14 +148,22 @@ def main() -> None:
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.checkpoint_every < 1 or args.max_runtime_minutes < 0:
         parser.error("epochs, batch size and checkpoint interval must be positive; runtime must be nonnegative")
-    cfg = replace(Config(), epochs=args.epochs, batch_size=args.batch_size)
+    manifest = json.loads((args.cache / "manifest.json").read_text(encoding="utf-8"))
+    cfg = replace(Config(**manifest["config"]), epochs=args.epochs, batch_size=args.batch_size)
+    task = manifest.get("task", "pitched")
+    stem = manifest.get("stem", "guitar")
+    if task not in ("pitched", "drums"):
+        raise ValueError(f"Unknown training task: {task}")
+    if task == "drums" and args.variant != "baseline":
+        parser.error("Drum training uses --variant baseline; harmonic gating is for pitched stems")
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     files = split_files(args.cache, cfg)
     dataset = WindowDataset(files["train"], cfg)
-    model = PolyphonicTranscriber(args.variant).to(device)
+    model = (DrumTranscriber(classes=cfg.pitches) if task == "drums"
+             else PolyphonicTranscriber(args.variant)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     onset_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(10.0, device=device))
     args.output.mkdir(parents=True, exist_ok=True)
@@ -163,6 +180,8 @@ def main() -> None:
             raise ValueError("Resume checkpoint format or feature version is incompatible")
         if saved["variant"] != args.variant:
             raise ValueError("Resume checkpoint belongs to a different variant")
+        if saved.get("task", "pitched") != task or saved.get("stem", "guitar") != stem:
+            raise ValueError("Resume checkpoint belongs to a different stem or task")
         for key, value in cfg.to_dict().items():
             if key != "epochs" and saved["config"][key] != value:
                 raise ValueError(f"Resume configuration differs in {key}")
@@ -184,7 +203,8 @@ def main() -> None:
     def save_progress(epoch: int, next_batch: int, loss_sum: float, loss_count: int) -> None:
         payload = {
             "checkpoint_format": CHECKPOINT_FORMAT, "feature_version": FEATURE_VERSION,
-            "variant": args.variant, "config": cfg.to_dict(), "model": model.state_dict(),
+            "variant": args.variant, "task": task, "stem": stem,
+            "config": cfg.to_dict(), "model": model.state_dict(),
             "optimizer": optimizer.state_dict(), "epoch": epoch, "next_batch": next_batch,
             "epoch_loss_sum": loss_sum, "epoch_loss_count": loss_count,
             "best_f1": best, "best_checkpoint": best_checkpoint, "history": history,
@@ -218,9 +238,10 @@ def main() -> None:
             x, y, onset = x.to(device), y.to(device), onset.to(device)
             optimizer.zero_grad(set_to_none=True)
             note_prob, onset_logits = model(x)
-            weights = 1.0 + 4.0 * y
+            weights = 1.0 + (9.0 if task == "drums" else 4.0) * y
             loss = torch.nn.functional.binary_cross_entropy(note_prob, y, weight=weights)
-            loss = loss + 0.25 * onset_loss(onset_logits, onset)
+            if task == "pitched":
+                loss = loss + 0.25 * onset_loss(onset_logits, onset)
             loss.backward()
             optimizer.step()
             loss_sum += float(loss.detach().cpu())
@@ -234,7 +255,7 @@ def main() -> None:
                 print(f"Paused at epoch {epoch}, batch {next_batch}; resume from {last_checkpoint}", flush=True)
                 return
         val_outputs = predictions(model, files["val"], device)
-        options = [(t, summarize(val_outputs, t, cfg)) for t in (0.25, 0.35, 0.45, 0.55, 0.65)]
+        options = [(t, summarize(val_outputs, t, cfg, task)) for t in (0.25, 0.35, 0.45, 0.55, 0.65)]
         threshold, val = max(options, key=lambda pair: pair[1]["frame"]["f1"])
         row = {"epoch": epoch, "loss": loss_sum / max(loss_count, 1), "threshold": threshold,
                "val_frame_f1": val["frame"]["f1"], "val_note_f1": val["note"]["f1"]}
@@ -244,7 +265,8 @@ def main() -> None:
             best = val["frame"]["f1"]
             best_checkpoint = {"model": copy.deepcopy(model.state_dict()),
                                "config": cfg.to_dict(), "feature_version": FEATURE_VERSION,
-                               "variant": args.variant, "threshold": threshold, "epoch": epoch}
+                               "variant": args.variant, "task": task, "stem": stem,
+                               "threshold": threshold, "epoch": epoch}
             atomic_torch_save(best_checkpoint, checkpoint)
         save_progress(epoch + 1, 0, 0.0, 0)
         write_status("in_progress", epoch + 1, 0)
@@ -252,19 +274,20 @@ def main() -> None:
         raise ValueError("No completed epoch available for evaluation")
     model.load_state_dict(best_checkpoint["model"])
     threshold = best_checkpoint["threshold"]
-    val = summarize(predictions(model, files["val"], device), threshold, cfg)
-    test = summarize(predictions(model, files["test"], device), threshold, cfg)
-    result = {"variant": args.variant, "best_epoch": best_checkpoint["epoch"], "threshold": threshold,
+    val = summarize(predictions(model, files["val"], device), threshold, cfg, task)
+    test = summarize(predictions(model, files["test"], device), threshold, cfg, task)
+    result = {"variant": args.variant, "task": task, "stem": stem,
+              "best_epoch": best_checkpoint["epoch"], "threshold": threshold,
               "validation": val, "test": test, "history": history,
-              "split": "train players 00-03; validation 04; test 05"}
+              "split": manifest.get("split", "dataset-defined train/validation/test")}
     (args.output / f"{args.variant}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps({"variant": args.variant, "test": test}, indent=2))
-    if args.variant == "baseline":
+    if args.variant == "baseline" and task == "pitched":
         fixed_val_outputs = predictions(model, files["val"], device, fixed_gate=True)
-        fixed_options = [(t, summarize(fixed_val_outputs, t, cfg)) for t in (0.25, 0.35, 0.45, 0.55, 0.65)]
+        fixed_options = [(t, summarize(fixed_val_outputs, t, cfg, task)) for t in (0.25, 0.35, 0.45, 0.55, 0.65)]
         fixed_threshold, fixed_val = max(fixed_options, key=lambda pair: pair[1]["frame"]["f1"])
         fixed_test = summarize(predictions(model, files["test"], device, fixed_gate=True),
-                               fixed_threshold, cfg)
+                               fixed_threshold, cfg, task)
         fixed_result = {"variant": "paper_gate", "best_epoch": best_checkpoint["epoch"],
                         "threshold": fixed_threshold, "validation": fixed_val, "test": fixed_test,
                         "split": result["split"], "gate_percentile": 10}

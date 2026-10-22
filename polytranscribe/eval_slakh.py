@@ -6,7 +6,6 @@ import math
 from collections import defaultdict, deque
 from pathlib import Path
 
-import mido
 import numpy as np
 import scipy.signal
 import soundfile as sf
@@ -16,27 +15,9 @@ import yaml
 from .config import Config
 from .data import frame_targets
 from .features import FEATURE_VERSION
-from .infer import transcribe_stem
+from .infer import midi_events, transcribe_stem
 from .metrics import frame_scores, frame_scores_by_polyphony, note_scores
 from .separate import MODEL, separate
-
-
-def midi_events(path: Path) -> list[tuple[float, float, int]]:
-    """Read note times in seconds, honoring tempo changes and note-on velocity zero."""
-    active = defaultdict(deque)
-    events = []
-    now = 0.0
-    for message in mido.MidiFile(path):
-        now += message.time
-        key = (getattr(message, "channel", 0), getattr(message, "note", -1))
-        if message.type == "note_on" and message.velocity > 0:
-            active[key].append(now)
-        elif message.type == "note_off" or (message.type == "note_on" and message.velocity == 0):
-            if active[key]:
-                start = active[key].popleft()
-                if now > start:
-                    events.append((start, now, int(message.note)))
-    return sorted(events)
 
 
 def merge_same_pitch_overlaps(events: list[tuple[float, float, int]]) -> list[tuple[float, float, int]]:
@@ -67,12 +48,14 @@ def guitar_sources(track: Path) -> list[tuple[Path, Path]]:
     for stem_id, stem in metadata["stems"].items():
         if str(stem.get("inst_class", "")).lower() != "guitar" or stem.get("is_drum", False):
             continue
-        if not stem.get("audio_rendered", True) or not stem.get("midi_saved", True):
+        # Trust the files: BabySlakh's rendered/saved flags can be stale.
+        try:
+            audio = audio_file(track / metadata.get("audio_dir", "stems") / stem_id)
+        except FileNotFoundError:
             continue
-        audio = audio_file(track / metadata.get("audio_dir", "stems") / stem_id)
         midi = track / metadata.get("midi_dir", "MIDI") / f"{stem_id}.mid"
         if not midi.is_file():
-            raise FileNotFoundError(midi)
+            continue
         sources.append((audio, midi))
     return sources
 

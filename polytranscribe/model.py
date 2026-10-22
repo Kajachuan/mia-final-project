@@ -43,3 +43,23 @@ class PolyphonicTranscriber(nn.Module):
             gate = torch.sigmoid(self.gate_head(self.gate_encoder(x[:, 3:])).squeeze(1))
             note = note * gate
         return note.clamp(1e-6, 1 - 1e-6), onset
+
+
+class DrumTranscriber(nn.Module):
+    """Predict simultaneous percussion classes from a log Mel spectrogram."""
+
+    def __init__(self, classes: int = 9):
+        super().__init__()
+        self.encoder = ConvStack(1, hidden=24)
+        self.head = nn.Sequential(
+            nn.Conv1d(24 * 8, 48, 3, padding=1), nn.ReLU(),
+            nn.Conv1d(48, classes, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.ndim != 4 or x.shape[1] != 1:
+            raise ValueError("Expected [batch, 1, mel_band, time] drum features")
+        hidden = self.encoder(x)
+        hidden = nn.functional.adaptive_avg_pool2d(hidden, (8, hidden.shape[-1]))
+        logits = self.head(hidden.flatten(1, 2))
+        return torch.sigmoid(logits).clamp(1e-6, 1 - 1e-6), logits
