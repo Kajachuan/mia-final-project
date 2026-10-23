@@ -12,14 +12,21 @@ from .stems import TARGET_STEMS
 
 
 def checkpoint_paths(models_root: Path) -> dict[str, Path]:
-    paths = {stem: models_root / stem / ("advanced.pt" if stem == "drums" else "advanced_gated.pt")
+    shared = models_root / "shared_gated.pt"
+    paths = {stem: (models_root / "drums" / "advanced.pt" if stem == "drums" else
+                    shared if shared.is_file() else models_root / stem / "advanced_gated.pt")
              for stem in TARGET_STEMS}
     missing = [str(path) for path in paths.values() if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Missing instrument checkpoints: {missing}")
     for stem, path in paths.items():
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("stem", "guitar") != stem:
+        if payload.get("stem") == "shared":
+            if (stem == "drums" or payload.get("variant") != "shared_gated"
+                    or stem not in payload.get("configs", {})
+                    or stem not in payload.get("thresholds", {})):
+                raise ValueError(f"Shared checkpoint cannot transcribe {stem}: {path}")
+        elif payload.get("stem", "guitar") != stem:
             raise ValueError(f"Checkpoint {path} does not belong to {stem}")
         if (payload.get("task", "pitched") == "drums") != (stem == "drums"):
             raise ValueError(f"Checkpoint task does not match {stem}: {path}")
@@ -35,7 +42,10 @@ def transcribe_mix(audio: Path, models_root: Path, output_dir: Path) -> dict:
     estimated = {}
     for stem in TARGET_STEMS:
         midi_path = output_dir / f"{stem}.mid"
-        note_counts[stem] = transcribe_stem(stems[stem], models[stem], midi_path)
+        if stem != "drums" and models[stem] == models_root / "shared_gated.pt":
+            note_counts[stem] = transcribe_stem(stems[stem], models[stem], midi_path, stem)
+        else:
+            note_counts[stem] = transcribe_stem(stems[stem], models[stem], midi_path)
         estimated[stem] = midi_events(midi_path)
     midi_path = output_dir / "five_stems.mid"
     write_multitrack_midi(estimated, midi_path)
@@ -73,7 +83,7 @@ def main() -> None:
     parser.add_argument("--audio", type=Path, required=True, help="Music mixture to separate")
     models = parser.add_mutually_exclusive_group(required=True)
     models.add_argument("--models-root", type=Path,
-                        help="Directory with vocals/advanced_gated.pt, drums/advanced.pt, etc.")
+                        help="Directory with shared_gated.pt and drums/advanced.pt")
     models.add_argument("--checkpoint", type=Path,
                         help="Legacy one-guitar ablation checkpoint")
     parser.add_argument("--output-dir", type=Path, required=True)

@@ -100,12 +100,12 @@ def split_files(cache: Path, cfg: Config) -> dict[str, list[Path]]:
 
 @torch.no_grad()
 def predictions(model: nn.Module, files: list[Path], device: torch.device,
-                fixed_gate: bool = False):
+                fixed_gate: bool = False, stem: str | None = None):
     model.eval()
     outputs = []
     for path in files:
         x, y, _, events = read_cache(path)
-        note, onset = predict_in_chunks(model, torch.from_numpy(x[None]), device)
+        note, onset = predict_in_chunks(model, torch.from_numpy(x[None]), device, stem=stem)
         note_prob = note[0].cpu().numpy()
         if fixed_gate:
             note_prob = paper_voicing_gate(note_prob, x)

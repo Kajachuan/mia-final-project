@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .stems import PITCH_RANGES
+
 
 class ConvStack(nn.Module):
     def __init__(self, channels: int, hidden: int = 32):
@@ -85,8 +87,9 @@ class ResidualBlock(nn.Module):
         return F.gelu(x + self.net(x))
 
 
-def positional_encoding(length: int, channels: int, device, dtype) -> torch.Tensor:
-    positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
+def positional_encoding(length: int, channels: int, device, dtype,
+                        offset: int = 0) -> torch.Tensor:
+    positions = torch.arange(offset, offset + length, device=device, dtype=torch.float32)[:, None]
     frequencies = torch.exp(torch.arange(0, channels, 2, device=device,
                                          dtype=torch.float32) * (-math.log(10000) / channels))
     encoding = torch.zeros((length, channels), device=device, dtype=torch.float32)
@@ -108,11 +111,11 @@ class FactorizedAttention(nn.Module):
         self.pitch = layer()
         self.time = layer()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pitch_offset: int = 0) -> torch.Tensor:
         batch, channels, pitches, frames = x.shape
         pitch_tokens = x.permute(0, 3, 2, 1).reshape(batch * frames, pitches, channels)
         pitch_tokens = self.pitch(pitch_tokens + positional_encoding(
-            pitches, channels, x.device, x.dtype)[None])
+            pitches, channels, x.device, x.dtype, pitch_offset)[None])
         time_tokens = pitch_tokens.reshape(batch, frames, pitches, channels)
         time_tokens = time_tokens.permute(0, 2, 1, 3).reshape(batch * pitches, frames, channels)
         time_tokens = self.time(time_tokens + positional_encoding(
@@ -125,10 +128,16 @@ class AdvancedPitchTranscriber(nn.Module):
 
     CANDIDATE_CHANNELS = (0, 2, 6, 7, 8, 9)
 
-    def __init__(self, gated: bool):
+    STEMS = ("vocals", "bass", "guitar", "piano")
+
+    def __init__(self, gated: bool, shared: bool = False):
         super().__init__()
         self.gated = gated
+        self.shared = shared
         self.input = nn.Conv2d(6, 64, 3, padding=1)
+        if shared:
+            self.stem_condition = nn.Embedding(len(self.STEMS), 128)
+            nn.init.zeros_(self.stem_condition.weight)
         self.high = nn.Sequential(ResidualBlock(64, 1), ResidualBlock(64, 2))
         self.down = nn.Sequential(
             nn.Conv2d(64, 64, 3, stride=(1, 2), padding=1), ResidualBlock(64, 4),
@@ -145,11 +154,21 @@ class AdvancedPitchTranscriber(nn.Module):
                 nn.Conv2d(32, 1, 1),
             )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, stem: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 4 or x.shape[1] != 10:
             raise ValueError("Expected ten pitch-aligned feature maps")
-        high = self.high(self.input(x[:, self.CANDIDATE_CHANNELS]))
-        low = self.attention(self.down(high))
+        encoded = self.input(x[:, self.CANDIDATE_CHANNELS])
+        if self.shared:
+            if stem not in self.STEMS:
+                raise ValueError(f"Shared model requires one of {self.STEMS}, got {stem!r}")
+            condition = self.stem_condition.weight[self.STEMS.index(stem)]
+            scale, bias = condition.chunk(2)
+            encoded = encoded * (1 + scale[None, :, None, None]) + bias[None, :, None, None]
+        elif stem is not None:
+            raise ValueError("Stem conditioning requires a shared model")
+        high = self.high(encoded)
+        low = self.attention(self.down(high),
+                             pitch_offset=PITCH_RANGES[stem][0] if self.shared else 0)
         context = F.interpolate(low, size=high.shape[-2:], mode="bilinear", align_corners=False)
         hidden = self.fusion(high + context)
         onset = self.onset_head(hidden).squeeze(1)
@@ -199,18 +218,23 @@ def build_transcriber(task: str, variant: str, classes: int) -> nn.Module:
             return PolyphonicTranscriber(variant)
         if variant in ("advanced_plain", "advanced_gated"):
             return AdvancedPitchTranscriber(gated=variant == "advanced_gated")
+        if variant in ("shared_plain", "shared_gated"):
+            return AdvancedPitchTranscriber(gated=variant == "shared_gated", shared=True)
     raise ValueError(f"Unsupported task/variant: {task}/{variant}")
 
 
 @torch.no_grad()
 def predict_in_chunks(model: nn.Module, x: torch.Tensor, device: torch.device,
-                      window_frames: int = 256, overlap: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+                      window_frames: int = 256, overlap: int = 32,
+                      stem: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Bound attention memory for a complete recording; return predictions on CPU."""
     if x.ndim != 4 or x.shape[0] != 1:
         raise ValueError("Expected one recording [1, channels, pitch_or_mel, time]")
     frames = x.shape[-1]
+    def forward(chunk: torch.Tensor):
+        return model(chunk.to(device), stem=stem) if stem is not None else model(chunk.to(device))
     if frames <= window_frames:
-        note, onset = model(x.to(device))
+        note, onset = forward(x)
         return note.cpu(), onset.cpu()
     stride = window_frames - overlap
     starts = list(range(0, frames - window_frames + 1, stride))
@@ -220,7 +244,7 @@ def predict_in_chunks(model: nn.Module, x: torch.Tensor, device: torch.device,
     onsets = None
     counts = torch.zeros((1, 1, frames), dtype=torch.float32)
     for start in starts:
-        note, onset = model(x[..., start:start + window_frames].to(device))
+        note, onset = forward(x[..., start:start + window_frames])
         note, onset = note.cpu(), onset.cpu()
         if notes is None:
             notes = torch.zeros((1, note.shape[1], frames), dtype=note.dtype)

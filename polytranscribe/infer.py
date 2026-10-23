@@ -2,6 +2,7 @@
 
 import argparse
 from collections import defaultdict, deque
+from functools import lru_cache
 from pathlib import Path
 
 import mido
@@ -12,6 +13,19 @@ from .features import FEATURE_VERSION, drum_features, load_audio, pitch_features
 from .metrics import decode_drums, decode_notes, paper_voicing_gate
 from .model import build_transcriber, predict_in_chunks
 from .stems import TARGET_STEMS
+
+
+@lru_cache(maxsize=6)
+def load_model(checkpoint_path: str, modified_ns: int, device_name: str):
+    """Reuse shared weights across the four pitched stems during inference."""
+    device = torch.device(device_name)
+    saved = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = saved["configs"]["guitar"] if saved.get("stem") == "shared" else saved["config"]
+    cfg = Config(**config)
+    model = build_transcriber(saved.get("task", "pitched"), saved["variant"], cfg.pitches).to(device)
+    model.load_state_dict(saved["model"])
+    model.eval()
+    return saved, model
 
 
 def write_midi(events: list[tuple[float, float, int]], path: Path,
@@ -87,32 +101,42 @@ def write_multitrack_midi(events_by_stem: dict[str, list[tuple[float, float, int
     midi.save(path)
 
 
-def transcribe_stem(audio_path: Path, checkpoint: Path, midi_path: Path) -> int:
+def transcribe_stem(audio_path: Path, checkpoint: Path, midi_path: Path,
+                    stem: str | None = None) -> int:
     """Apply a pitched or percussion model to its corresponding stem."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    saved = torch.load(checkpoint, map_location=device, weights_only=False)
+    saved, model = load_model(str(checkpoint.resolve()), checkpoint.stat().st_mtime_ns,
+                              device.type)
     if saved.get("feature_version") != FEATURE_VERSION:
         raise ValueError("Checkpoint uses an outdated feature schema; retrain the model")
-    cfg = Config(**saved["config"])
+    shared = saved.get("stem") == "shared"
+    if shared:
+        if stem not in saved["configs"]:
+            raise ValueError("A shared checkpoint requires a supported --stem")
+        cfg = Config(**saved["configs"][stem])
+        threshold = saved["thresholds"][stem]
+    else:
+        if stem is not None and stem != saved.get("stem", "guitar"):
+            raise ValueError(f"Checkpoint does not belong to {stem}")
+        stem = saved.get("stem", "guitar")
+        cfg = Config(**saved["config"])
+        threshold = saved["threshold"]
     task = saved.get("task", "pitched")
-    model = build_transcriber(task, saved["variant"], cfg.pitches).to(device)
-    model.load_state_dict(saved["model"])
-    model.eval()
     with torch.no_grad():
         audio = load_audio(audio_path, cfg)
         features = drum_features(audio, cfg, device) if task == "drums" else pitch_features(audio, cfg, device)
         x = torch.from_numpy(features.astype("float32"))[None]
-        note, onset = predict_in_chunks(model, x, device)
+        note, onset = predict_in_chunks(model, x, device, stem=stem if shared else None)
         note_prob = note[0].cpu().numpy()
         if saved.get("gate_mode") == "paper_fixed":
             if task == "drums":
                 raise ValueError("The harmonic voicing gate is not defined for drums")
             note_prob = paper_voicing_gate(note_prob, x[0].numpy())
-        events = (decode_drums(note_prob, cfg, threshold=saved["threshold"])
+        events = (decode_drums(note_prob, cfg, threshold=threshold)
                   if task == "drums" else
                   decode_notes(note_prob, torch.sigmoid(onset[0]).cpu().numpy(),
-                               cfg, threshold=saved["threshold"]))
-    write_midi(events, midi_path, stem=saved.get("stem", "guitar"))
+                               cfg, threshold=threshold))
+    write_midi(events, midi_path, stem=stem)
     return len(events)
 
 
@@ -121,8 +145,10 @@ def main() -> None:
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--midi", type=Path, required=True)
+    parser.add_argument("--stem", choices=TARGET_STEMS,
+                        help="Required for a shared pitched checkpoint")
     args = parser.parse_args()
-    count = transcribe_stem(args.audio, args.checkpoint, args.midi)
+    count = transcribe_stem(args.audio, args.checkpoint, args.midi, args.stem)
     print(f"Wrote {count} notes to {args.midi}")
 
 
