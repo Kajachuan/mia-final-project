@@ -3,6 +3,7 @@ import json
 import sys
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from polytranscribe.model import (AdvancedDrumTranscriber, AdvancedPitchTranscriber,
@@ -80,7 +81,17 @@ def test_advanced_training_and_paper_gate_checkpoint(tmp_path, monkeypatch):
     train.main()
     assert (output / "advanced_plain.pt").exists()
     assert (output / "advanced_paper_gate.pt").exists()
-    assert torch.load(output / "advanced_plain_last.pt", weights_only=False)["checkpoint_format"] == 2
+    saved = torch.load(output / "advanced_plain_last.pt", weights_only=False)
+    assert saved["checkpoint_format"] == train.CHECKPOINT_FORMAT
+    assert saved["cache_identity"] == train.manifest_identity(manifest)
+    manifest["source"] = "another-dataset"
+    (cache / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["train", "--cache", str(cache), "--output", str(output),
+                                      "--variant", "advanced_plain", "--epochs", "2",
+                                      "--batch-size", "1", "--window-frames", "32",
+                                      "--resume", str(output / "advanced_plain_last.pt")])
+    with pytest.raises(ValueError, match="different cache or dataset"):
+        train.main()
 
 
 def test_external_midi_benchmark_uses_shared_metrics(tmp_path, monkeypatch):

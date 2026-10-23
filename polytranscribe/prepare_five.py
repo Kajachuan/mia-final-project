@@ -208,6 +208,7 @@ def main() -> None:
                     "counts": dict(manifest["counts"]),
                     "file_splits": manifest["file_splits"],
                     "out_of_range_notes": manifest["out_of_range_notes"],
+                    "max_slakh_tracks": args.max_slakh_tracks if stem != "vocals" else None,
                     "split": ("Vocadito track 1-32/33-36/37-40 (not singer-disjoint)" if stem == "vocals"
                               else "Slakh official split, or deterministic BabySlakh prototype split"),
                     "source": str(args.vocadito_root if stem == "vocals" else args.slakh_root)}

@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import hashlib
 import json
 import random
 import time
@@ -23,6 +24,15 @@ from .model import build_transcriber, predict_in_chunks
 
 
 CHECKPOINT_FORMAT = 2
+
+
+def manifest_identity(manifest: dict) -> str:
+    """Bind a resumable run to its source, selection and split assignments."""
+    fields = {key: manifest.get(key) for key in
+              ("feature_version", "task", "stem", "source", "max_slakh_tracks",
+               "counts", "file_splits", "split", "config")}
+    serialized = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def atomic_torch_save(payload: dict, path: Path) -> None:
@@ -153,6 +163,7 @@ def main() -> None:
             or args.checkpoint_every < 1 or args.max_runtime_minutes < 0):
         parser.error("epochs, batch size and checkpoint interval must be positive; runtime must be nonnegative")
     manifest = json.loads((args.cache / "manifest.json").read_text(encoding="utf-8"))
+    cache_identity = manifest_identity(manifest)
     advanced = args.variant.startswith("advanced")
     cfg = replace(Config(**manifest["config"]), epochs=args.epochs,
                   batch_size=args.batch_size or (4 if advanced else 16),
@@ -186,6 +197,9 @@ def main() -> None:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
         if saved.get("checkpoint_format") != CHECKPOINT_FORMAT or saved.get("feature_version") != FEATURE_VERSION:
             raise ValueError("Resume checkpoint format or feature version is incompatible")
+        legacy_without_identity = saved.get("cache_identity") is None and stem in ("guitar", "vocals")
+        if not legacy_without_identity and saved.get("cache_identity") != cache_identity:
+            raise ValueError("Resume checkpoint was trained on a different cache or dataset")
         if saved["variant"] != args.variant:
             raise ValueError("Resume checkpoint belongs to a different variant")
         if saved.get("task", "pitched") != task or saved.get("stem", "guitar") != stem:
@@ -211,6 +225,7 @@ def main() -> None:
     def save_progress(epoch: int, next_batch: int, loss_sum: float, loss_count: int) -> None:
         payload = {
             "checkpoint_format": CHECKPOINT_FORMAT, "feature_version": FEATURE_VERSION,
+            "cache_identity": cache_identity,
             "variant": args.variant, "task": task, "stem": stem,
             "config": cfg.to_dict(), "model": model.state_dict(),
             "optimizer": optimizer.state_dict(), "epoch": epoch, "next_batch": next_batch,
@@ -276,6 +291,7 @@ def main() -> None:
             best = val["note"]["f1"]
             best_checkpoint = {"model": copy.deepcopy(model.state_dict()),
                                "config": cfg.to_dict(), "feature_version": FEATURE_VERSION,
+                               "cache_identity": cache_identity,
                                "variant": args.variant, "task": task, "stem": stem,
                                "threshold": threshold, "epoch": epoch}
             atomic_torch_save(best_checkpoint, checkpoint)

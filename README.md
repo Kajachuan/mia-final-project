@@ -8,11 +8,11 @@ El sistema sigue la estructura modular de [Rashmi et al. (2026)](https://doi.org
 | --- | --- | --- |
 | `guitar` | [GuitarSet 1.1.0](https://doi.org/10.5281/zenodo.3371780): 360 fragmentos de guitarra acústica con notas por cuerda. En Kaggle se adjunta [alonhaviv/guitarset](https://www.kaggle.com/datasets/alonhaviv/guitarset). | Notas MIDI simultáneas. |
 | `vocals` | [Vocadito v3](https://zenodo.org/records/5578807): 40 fragmentos de canto solista con notas manuales. | Notas MIDI de voz. |
-| `bass`, `piano`, `drums` | [Slakh2100-redux](https://zenodo.org/records/4599666): mezclas, stems y MIDI alineado. [BabySlakh](https://zenodo.org/records/4603844) aporta 20 temas a 16 kHz para probar el pipeline. | Notas MIDI de bajo y piano; nueve clases de golpes de batería. |
+| `bass`, `piano`, `drums` | [Slakh2100-redux](https://www.kaggle.com/datasets/alonhaviv/slakh2100): mezclas, stems y MIDI alineado, adjuntado en Kaggle como dataset. | Notas MIDI de bajo y piano; nueve clases de golpes de batería. |
 
-Slakh no contiene voces cantadas, y GuitarSet solo anota guitarra. Por eso la primera versión usa **tres fuentes de datos**. Los cuatro modelos con altura comparten la misma arquitectura, pero tienen checkpoints y rangos MIDI propios: voz 36–88, bajo 28–67, guitarra 40–82 y piano 21–108. La batería usa un modelo de golpes con bloques residuales y atención temporal sobre Mel, con nueve clases General MIDI: bombo, caja, hi-hat cerrado y abierto, tom, crash, ride, clap/rim y otra percusión. Demucs es preentrenado y no se ajusta en estos datasets. El Slakh2100 original ocupa unos 105 GB; la [versión redux a 16 kHz](https://zenodo.org/records/7708270) ocupa unos 49 GB. `MAX_SLAKH_TRACKS` limita cuántos temas se procesan dentro de Kaggle.
+Slakh no contiene voces cantadas, y GuitarSet solo anota guitarra. Por eso la primera versión usa **tres fuentes de datos**. Hay **cinco transcriptores con pesos independientes**, uno por stem; los cuatro modelos con altura comparten la misma arquitectura, pero tienen checkpoints y rangos MIDI propios: voz 36–88, bajo 28–67, guitarra 40–82 y piano 21–108. La batería usa una arquitectura distinta para golpes, con bloques residuales y atención temporal sobre Mel y nueve clases General MIDI: bombo, caja, hi-hat cerrado y abierto, tom, crash, ride, clap/rim y otra percusión. Demucs es un único separador preentrenado que se ejecuta una vez por mezcla. El dataset de Kaggle [alonhaviv/slakh2100](https://www.kaggle.com/datasets/alonhaviv/slakh2100) contiene `slakh2100_flac_redux` (aprox. 108 GB); `MAX_SLAKH_TRACKS` limita cuántos temas se procesan dentro de Kaggle.
 
-**Alcance experimental:** BabySlakh y Vocadito son pequeños; permiten verificar entrenamiento e inferencia, no demostrar generalización de cinco instrumentos. Para los resultados finales habrá que usar una muestra amplia de Slakh2100-redux y ampliar los datos de voz, por ejemplo con [Annotated-VocalSet](https://zenodo.org/records/7061507). Los modelos aún no se entrenaron en Kaggle y no se reportan precisiones inventadas.
+**Alcance experimental:** el notebook selecciona 100 temas de Slakh2100-redux por defecto para limitar tiempo y espacio; para los resultados finales habrá que ampliar esa muestra. Vocadito tiene solo 40 fragmentos, por lo que también conviene ampliar los datos de voz, por ejemplo con [Annotated-VocalSet](https://zenodo.org/records/7061507). Los modelos aún no se entrenaron en Kaggle y no se reportan precisiones inventadas.
 
 ## Método
 
@@ -24,22 +24,22 @@ El experimento anterior de guitarra queda disponible en [train_guitarset.ipynb](
 
 ## Entrenar en Kaggle
 
-1. Adjuntar GuitarSet como **Add Input** en `/kaggle/input/guitarset` y abrir [train_five_stems.ipynb](kaggle/train_five_stems.ipynb). Primero hay que publicar este código en el remoto para que el notebook pueda clonarlo.
-2. Indicar `SLAKH_ROOT` y `VOCADITO_ROOT` si los datasets ya están adjuntos. Si quedan vacíos, `AUTO_DOWNLOAD_AUX = True` descarga las versiones públicas de Vocadito (58 MB) y BabySlakh (~883 MB) desde Zenodo, verifica MD5 y las extrae. Para un experimento mayor, adjuntar Slakh2100-redux, fijar `SLAKH_ROOT`, desactivar la descarga auxiliar correspondiente y aumentar `MAX_SLAKH_TRACKS`.
+1. Adjuntar [GuitarSet](https://www.kaggle.com/datasets/alonhaviv/guitarset) y [Slakh2100](https://www.kaggle.com/datasets/alonhaviv/slakh2100) como **Add Input** y abrir [train_five_stems.ipynb](kaggle/train_five_stems.ipynb). El notebook busca `/kaggle/input/datasets/alonhaviv/guitarset` y `/kaggle/input/datasets/alonhaviv/slakh2100/slakh2100_flac_redux`, con alternativas para el montaje corto de Kaggle. No descarga ninguno de estos dos datasets.
+2. `AUTO_DOWNLOAD_VOCADITO = True` descarga Vocadito v3 (58 MB) desde Zenodo, verifica MD5 y lo extrae. Si ya está adjuntado, indicar `VOCADITO_ROOT`. Ajustar `MAX_SLAKH_TRACKS` para ampliar el subconjunto de Slakh; `0` procesa todos los temas. Al cambiar ese límite o la fuente de Slakh se reconstruye la caché instrumental.
 3. Ejecutar el notebook con GPU e Internet. Escribe características en `/kaggle/working/five_cache`, checkpoints en `/kaggle/working/runs_five/<stem>/` y, cuando los cinco modelos completan el entrenamiento, prueba una mezcla y crea `five_stems.mid`.
 
 Los comandos principales, dentro de Kaggle y desde la raíz del repositorio, son:
 
 ```bash
-python -m polytranscribe.prepare --source-root /kaggle/input/guitarset --root /kaggle/working/guitarset
-python -m polytranscribe.download_aux --output /kaggle/working/aux --dataset both
-python -m polytranscribe.prepare_five --slakh-root /kaggle/working/aux/babyslakh --vocadito-root /kaggle/working/aux/vocadito --output /kaggle/working/five_cache
+python -m polytranscribe.prepare --source-root /kaggle/input/datasets/alonhaviv/guitarset --root /kaggle/working/guitarset
+python -m polytranscribe.download_aux --output /kaggle/working/aux --dataset vocadito
+python -m polytranscribe.prepare_five --slakh-root /kaggle/input/datasets/alonhaviv/slakh2100/slakh2100_flac_redux --vocadito-root /kaggle/working/aux/vocadito --output /kaggle/working/five_cache --max-slakh-tracks 100
 python -m polytranscribe.pipeline --audio /ruta/mezcla.wav --models-root /kaggle/working/runs_five --output-dir /kaggle/working/demo
 ```
 
 El notebook ejecuta ocho entrenamientos sobre cinco stems: `baseline`, `gated`, `advanced_plain` y `advanced_gated` para guitarra, `advanced_gated` para voz, bajo y piano, y `advanced` para batería. Así las comparaciones de guitarra usan la misma partición, longitud de ventana y tamaño de lote. La opción `--models-root` requiere los cinco checkpoints de producción. Para la comparación de una sola guitarra se conserva `--checkpoint`. Los modelos avanzados usan ventanas de 256 frames y lotes de 4 en entrenamiento; ambos valores se pueden ajustar en Kaggle según la GPU.
 
-Cada entrenamiento guarda `<variante>_last.pt` **cada 25 lotes y al cerrar cada época**, con modelo, optimizador, estado aleatorio, época, lote siguiente y mejor modelo. `<variante>.pt` es el mejor checkpoint para inferencia. El notebook limita la duración de la sesión y permite reanudar desde una salida anterior fijando `PREVIOUS_OUTPUT`. Usar **Save Version** y adjuntar esa salida como **Notebook Output Files** en la próxima sesión; [Kaggle documenta su reutilización](https://www.kaggle.com/docs/notebooks). Esta arquitectura usa la versión 4 de las características: caches y checkpoints anteriores deben regenerarse; el notebook rechaza los incompatibles. Si se cambia de BabySlakh a Slakh2100, activar `REBUILD_AUX_CACHE` y entrenar de nuevo los modelos afectados.
+Cada entrenamiento guarda `<variante>_last.pt` **cada 25 lotes y al cerrar cada época**, con modelo, optimizador, estado aleatorio, época, lote siguiente y mejor modelo. `<variante>.pt` es el mejor checkpoint para inferencia. El notebook limita la duración de la sesión y permite reanudar desde una salida anterior fijando `PREVIOUS_OUTPUT`. Usar **Save Version** y adjuntar esa salida como **Notebook Output Files** en la próxima sesión; [Kaggle documenta su reutilización](https://www.kaggle.com/docs/notebooks). Los checkpoints nuevos vinculan la reanudación con la fuente, los splits y el límite de temas de su caché. Los checkpoints anteriores de GuitarSet y Vocadito siguen siendo reanudables; los de bajo, piano y batería anteriores a esta comprobación se rechazan porque no permiten verificar con qué versión de Slakh se entrenaron. Al cambiar de BabySlakh a Slakh2100 hay que regenerar la caché y entrenar de nuevo esos tres modelos.
 
 ## Evaluación y límites
 

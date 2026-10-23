@@ -62,7 +62,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("data/guitarset"))
     parser.add_argument("--source-root", type=Path,
-                        help="Existing extracted GuitarSet, e.g. /kaggle/input/guitarset")
+                        help="Existing GuitarSet, e.g. /kaggle/input/datasets/alonhaviv/guitarset")
     parser.add_argument("--annotation-zip", type=Path)
     parser.add_argument("--audio-zip", type=Path)
     parser.add_argument("--download", action="store_true", help="Requires Kaggle Internet enabled")
