@@ -163,7 +163,8 @@ def evaluate(data_root: Path, checkpoint: Path, output: Path, split: str,
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if saved.get("feature_version") != FEATURE_VERSION:
         raise ValueError("Checkpoint feature version is incompatible")
-    cfg = Config(**saved["config"])
+    cfg = Config(**(saved["configs"]["guitar"] if saved.get("stem") == "shared"
+                    else saved["config"]))
     tracks = sorted(path.parent for path in data_root.rglob("metadata.yaml")
                     if "omitted" not in path.parts and
                     (split == "any" or split in path.relative_to(data_root).parts))
@@ -185,11 +186,17 @@ def evaluate(data_root: Path, checkpoint: Path, output: Path, split: str,
         mixture_path = clip_audio(audio_file(track / "mix"), track_output / "mixture_clip.wav", seconds)
         oracle_midi = track_output / "oracle_prediction.mid"
         separated_midi = track_output / "separated_prediction.mid"
-        transcribe_stem(oracle_path, checkpoint, oracle_midi)
+        if saved.get("stem") == "shared":
+            transcribe_stem(oracle_path, checkpoint, oracle_midi, stem="guitar")
+        else:
+            transcribe_stem(oracle_path, checkpoint, oracle_midi)
         separated_guitar = track_output / "stems" / MODEL / mixture_path.stem / "guitar.wav"
         if not separated_guitar.is_file():
             separated_guitar = separate(mixture_path, track_output / "stems")["guitar"]
-        transcribe_stem(separated_guitar, checkpoint, separated_midi)
+        if saved.get("stem") == "shared":
+            transcribe_stem(separated_guitar, checkpoint, separated_midi, stem="guitar")
+        else:
+            transcribe_stem(separated_guitar, checkpoint, separated_midi)
         duration = sf.info(mixture_path).duration
         row = {
             "track": str(relative), "guitar_sources": len(sources),
